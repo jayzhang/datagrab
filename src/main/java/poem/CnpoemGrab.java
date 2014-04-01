@@ -2,7 +2,9 @@ package poem;
 
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -23,9 +25,15 @@ import com.gbdata.common.mongo.Entity;
 import com.gbdata.common.mongo.MongoEntityClient;
 import com.gbdata.common.mq.IMQWorker;
 import com.gbdata.common.mq.RabbitMQConsumer;
+import com.gbdata.common.mq.RabbitMQProducer;
 import com.gbdata.common.util.JsoupUtil;
 import com.gbdata.common.util.Logger;
+import com.gbdata.common.util.PagingUtil;
 import com.gbdata.common.util.StringUtil;
+import com.mongodb.AggregationOutput;
+import com.mongodb.BasicDBObject;
+import com.mongodb.DBCollection;
+import com.mongodb.DBObject;
 
 public class CnpoemGrab implements IMQWorker{
 
@@ -37,7 +45,7 @@ public class CnpoemGrab implements IMQWorker{
 	
 	String TablePoem = "poem";
 	
-	String Queue = "CnpoemGrab";
+	String Queue = "CnpoemPage";
 	
 	HttpClient httpClient = new HttpClient();
 	
@@ -227,17 +235,73 @@ public class CnpoemGrab implements IMQWorker{
 	}
 	
 	
-	public void grabPoem()
+	public void grabPoemDispatch()
 	{
-//		RabbitMQProducer prod = new RabbitMQProducer(Queue);
-//		for(Entity e: mongo.iterator(TableAuthor))
-//			prod.send(e.getJSONObjectContent().toJSONString());
-//		prod.close();
+		BasicDBObject group = new BasicDBObject("_id", "$content.author").append("count", new BasicDBObject("$sum", 1));
+
+		DBCollection coll = mongo.getDb().getCollection("poem");
+		
+		AggregationOutput output = coll.aggregate(new BasicDBObject("$group", group));
+		
+		Map<String, Integer> authorPoemCount = new HashMap<String, Integer>();
+		
+		for(DBObject obj : output.results())
+		{
+			BasicDBObject o = (BasicDBObject)obj;
+			
+			authorPoemCount.put(o.getString("_id"), o.getInt("count"));
+		}
 		
 		
+		RabbitMQProducer prod = new RabbitMQProducer(Queue);
+		prod.clear();
+		for(Entity e: mongo.iterator(TableAuthor).showProgress())
+		{
+			JSONObject obj = e.getJSONObjectContent();
+			
+			String author = obj.getString("name");
+			
+			String url = obj.getString("url");
+			
+			int poemnum = obj.getInt("poemnum", 0);
+			
+			Integer grabbedCount = authorPoemCount.get(author);
+			
+			if(grabbedCount != null && grabbedCount.intValue() == poemnum)
+				continue;
+			
+			
+			
+			int totalPage = PagingUtil.getPage(poemnum, 10);
+			
+			Logger.logger.info("missing author: " + author + ", totalPage:" + totalPage + ", grabbed:" + grabbedCount + ", expedted:" + poemnum);
+			
+			JSONObject msg = new JSONObject();
+			msg.put("author", author);
+			msg.put("url", url);
+			msg.put("pageurl", url);
+			
+			prod.send(msg.toJSONString());
+			
+			for(int page = 2; page <= totalPage; ++ page)
+			{
+				String pageurl = url + "&page=" + page;
+				msg = new JSONObject();
+				msg.put("author", author);
+				msg.put("url", url);
+				msg.put("pageurl", pageurl);
+
+				prod.send(msg.toJSONString());
+			}
+		}
+		prod.close();
+	}
+	
+	public void grabPoemWork()
+	{
 		ExecutorService threadPool = Executors.newCachedThreadPool();
 		
-		for (int i = 0; i < 20; i++) 
+		for (int i = 0; i < 10; i++) 
 		{
 			threadPool.submit(new Runnable() 
 			{
@@ -265,12 +329,10 @@ public class CnpoemGrab implements IMQWorker{
 		
 		JSONObject obj = JSONValue.parseJSONObject(message);
 		
-		grabPoem(obj);
-		
-		return true;
+		return grabAuthorPage(obj);
 	}
 	
-	private void grabPoem(JSONObject author)
+	private boolean grabPoem(JSONObject author)
 	{
 		String name = author.getString("name");
 		
@@ -281,35 +343,43 @@ public class CnpoemGrab implements IMQWorker{
 		if(cont == null)
 		{
 			System.err.println("error:" + author);
-			return;
+			return false;
 		}
 		
 		Document doc = cont.getDocument("GBK");
-		
 		
 		Element p = doc.select("p[align=center]:containsOwn(条/页)").first();
 		
 		int totalPage = 0;
 		
+		int total = 0;
+		
 		if(p != null)
 		{
 			String pageTxt = p.text();
 			
+			String tmp = StringUtils.substringBetween(pageTxt, "共", "篇作品");
+			
+			tmp = StringUtil.trim(tmp);
+			
+			if(!StringUtil.isEmpty(tmp) && StringUtils.isNumeric(tmp))
+				total = Integer.valueOf(tmp);
+			
 			pageTxt = StringUtils.substringAfter(pageTxt, "条/页");
 			
-			String tmp = StringUtils.substringBetween(pageTxt, "共", "页");
-			
+			tmp = StringUtils.substringBetween(pageTxt, "共", "页");
+			tmp = StringUtil.trim(tmp);
 			if(!StringUtil.isEmpty(tmp) && StringUtils.isNumeric(tmp))
 				totalPage = Integer.valueOf(tmp);
 		}
 		
-		parsePoemList(name, doc);
+		int grabtotal = 0;
 		
-//		int page = 2;
+		grabtotal += parsePoemList(name, doc);
 		
 		for(int page = 2; page<= totalPage; ++ page)
 		{
-			Logger.logger.info("Page:" + page);
+			Logger.logger.info("Page:" + page + "/" + totalPage);
 			
 			String nexturl = url + "&page=" + page;
 			
@@ -318,14 +388,37 @@ public class CnpoemGrab implements IMQWorker{
 			if(cont != null)
 			{
 				doc = cont.getDocument("GBK");
-				parsePoemList(name, doc);
+				grabtotal += parsePoemList(name, doc);
 			}
 		}
+		
+		return (grabtotal == total);
 	}
 	
-	
-	private void parsePoemList(String author, Document doc)
+	private boolean grabAuthorPage(JSONObject page)
 	{
+		String author = page.getString("author");
+		
+		String url = page.getString("pageurl");
+		
+		Content cont = httpClient.get(url);
+		
+		if(cont == null)
+		{
+			System.err.println("error:" + page);
+			return false;
+		}
+		
+		Document doc = cont.getDocument("GBK");
+		
+		int cc =  parsePoemList(author, doc);
+		
+		return cc > 0;
+	}
+	
+	private int parsePoemList(String author, Document doc)
+	{
+		int cc = 0;
 		for(Element a : doc.select("td li a[href^=MusicList.asp?Specialid=]"))
 		{
 			String poemurl = a.absUrl("href");
@@ -341,8 +434,10 @@ public class CnpoemGrab implements IMQWorker{
 			poem.put("title", title);
 			
 			grabPoemDetail(poem);
-//			
+			
+			cc ++;
 		}
+		return cc;
 	}
 	
 	public void grabPoemDetail(JSONObject poem)
@@ -350,6 +445,9 @@ public class CnpoemGrab implements IMQWorker{
 		String poemurl = poem.getString("url");
 		
 		String poemid = StringUtils.substringAfter(poemurl, "Specialid=");
+		
+		if(mongo.exist(TablePoem, poemid))
+			return ;
 		
 		Content cont = httpClient.get(poemurl);
 		
@@ -411,7 +509,7 @@ public class CnpoemGrab implements IMQWorker{
 		Entity e = mongo.get(TableAuthor, "李白");
 		
 		try {
-			this.execTask(e.getJSONObjectContent().toJSONString());
+			execTask(e.getJSONObjectContent().toJSONString());
 		} catch (Exception e1) {
 			// TODO Auto-generated catch block
 			e1.printStackTrace();
@@ -427,15 +525,9 @@ public class CnpoemGrab implements IMQWorker{
 		
 //		w.grabAuthor();
 		
-		w.grabPoem();
-		
-//		try {
-//			System.out.println(URLEncoder.encode("周", "gbk"));
-//		} catch (UnsupportedEncodingException e) {
-//			// TODO Auto-generated catch block
-//			e.printStackTrace();
-//		}
-//		w.test();
+//		w.grabPoemDispatch();
+		w.grabPoemWork();
+		 
 	}
 
 
